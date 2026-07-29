@@ -41,6 +41,18 @@ on:
         description: 'BUILD_TARGET'
         required: true
         default: 'recovery'
+      ANDROID_TARGET:
+        description: 'Android version this build targets'
+        required: true
+        default: 'Android 14'
+        type: choice
+        options:
+          - Android 11
+          - Android 12
+          - Android 13
+          - Android 14
+          - Android 15
+          - Android 16
 #      PATCH_INSTALLET:
 #        description: 'Patch recovery installer'
 #        required: true
@@ -78,6 +90,7 @@ jobs:
         echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
         echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
         echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
+        echo "Android Target: ${{ github.event.inputs.ANDROID_TARGET }}"
         echo "::endgroup::"
 
     # You might want to Checkout your repo first, but not mandatory
@@ -131,17 +144,7 @@ jobs:
         git config --global user.email "b170420nc@gmail.com"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
       id: pwd
-
-    - name: Repo Sync
-      run: |
-        repo sync -j$(nproc --all) --force-sync
-      working-directory: workspace
-
-    - name: Clone device tree
-      run: |
-        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
+      
     - name: Clone common tree
       if: |
         github.event.inputs.COMMON_TREE_URL != null
@@ -180,22 +183,135 @@ jobs:
         lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
         TIMESTAMP=$(date +"%Y%m%d")
         echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
-        cp out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img ../TWRP-OP12-$TIMESTAMP.img
+        cp out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img ../TWRP-${{ github.event.inputs.DEVICE_NAME }}-$TIMESTAMP.img
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    - name: Upload to Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: | 
-          *.img
-#          # workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
-#          # workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-#          # workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
-        name: TWRP-${{ env.TIMESTAMP }}-Testing
-        tag_name: ${{ env.TIMESTAMP }}-Testimg
-        body: |
-          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: OnePlus 12 (Waffle)
-          Target: Android 14/Android 15/Android 16
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Building flashable zip
+      run: |
+        IMG_NAME="TWRP-${{ github.event.inputs.DEVICE_NAME }}-${TIMESTAMP}.img"
+        ZIP_NAME="TWRP-${{ github.event.inputs.DEVICE_NAME }}-${TIMESTAMP}-flashable.zip"
+
+        mkdir -p flashable_zip/META-INF/com/google/android
+        cp "${IMG_NAME}" flashable_zip/recovery.img
+
+        cat > flashable_zip/META-INF/com/google/android/update-binary << 'EOF'
+        #!/sbin/sh
+        # ****************************************************************
+        # Flashable zip installer for TWRP recovery.img (RMX2020/RMX2027)
+        # Checks: device match, partition existence, size fit, and a
+        # flash_image -> dd fallback, mirroring what stock OFOX zips do.
+        # ****************************************************************
+
+        OUTFD="/proc/self/fd/$2"
+        ZIPFILE="$3"
+
+        ui_print() {
+          until [ ! "$1" ]; do
+            echo -e "ui_print $1\nui_print" >> "$OUTFD"
+            shift
+          done
+        }
+
+        abort() {
+          ui_print "$*"
+          exit 1
+        }
+
+        TARGET_DEVICE="${{ github.event.inputs.DEVICE_NAME }}"
+        TARGET_DEVICE_ALT="RMX2027"
+
+        GETPROP=$(which getprop 2>/dev/null)
+        [ -z "$GETPROP" ] && GETPROP=/system/bin/getprop
+        [ ! -e "$GETPROP" ] && GETPROP=/sbin/getprop
+
+        PRODUCT_DEVICE=$($GETPROP "ro.product.device")
+
+        case "$PRODUCT_DEVICE" in
+          "$TARGET_DEVICE"|"$TARGET_DEVICE_ALT") ;;
+          *) abort "E3004: This package is for $TARGET_DEVICE/$TARGET_DEVICE_ALT. This device ($PRODUCT_DEVICE) is not supported." ;;
+        esac
+
+        ui_print "- Installing recovery for $PRODUCT_DEVICE ..."
+
+        TMP_DIR=/tmp/recovery_flash_$$
+        mkdir -p "$TMP_DIR"
+
+        ui_print "- Extracting recovery.img from zip..."
+        unzip -o "$ZIPFILE" recovery.img -d "$TMP_DIR" || abort "E3005: Failed to extract recovery.img from the zip."
+
+        [ -f "$TMP_DIR/recovery.img" ] || abort "E3006: recovery.img not found after extraction."
+
+        RECOVERY_PARTITION=$(find /dev/block/bootdevice/by-name -iname "recovery" 2>/dev/null | head -n1)
+        [ -z "$RECOVERY_PARTITION" ] && RECOVERY_PARTITION=$(find /dev/block/by-name -iname "recovery" 2>/dev/null | head -n1)
+        [ -z "$RECOVERY_PARTITION" ] && abort "E3007: Could not locate the recovery partition on this device."
+
+        ui_print "- Found recovery partition: $RECOVERY_PARTITION"
+
+        PART_SIZE=$(blockdev --getsize64 "$RECOVERY_PARTITION" 2>/dev/null)
+        IMG_SIZE=$(wc -c < "$TMP_DIR/recovery.img")
+
+        if [ -n "$PART_SIZE" ] && [ "$IMG_SIZE" -gt "$PART_SIZE" ]; then
+          rm -rf "$TMP_DIR"
+          abort "E3008: recovery.img ($IMG_SIZE bytes) is bigger than the recovery partition ($PART_SIZE bytes)."
+        fi
+
+        FLASH_IMAGE=$(which flash_image 2>/dev/null)
+        [ -z "$FLASH_IMAGE" ] && [ -e /sbin/flash_image ] && FLASH_IMAGE=/sbin/flash_image
+        ERASE_IMAGE=$(which erase_image 2>/dev/null)
+        [ -z "$ERASE_IMAGE" ] && [ -e /sbin/erase_image ] && ERASE_IMAGE=/sbin/erase_image
+
+        FLASH_OK=0
+
+        if [ -x "$FLASH_IMAGE" ]; then
+          ui_print "- Flashing via flash_image..."
+          [ -x "$ERASE_IMAGE" ] && "$ERASE_IMAGE" "$RECOVERY_PARTITION" >/dev/null 2>&1
+          "$FLASH_IMAGE" "$RECOVERY_PARTITION" "$TMP_DIR/recovery.img" && FLASH_OK=1
+        fi
+
+        if [ "$FLASH_OK" != "1" ]; then
+          ui_print "- Flashing via dd..."
+          dd if="$TMP_DIR/recovery.img" of="$RECOVERY_PARTITION" bs=4096 && FLASH_OK=1
+        fi
+
+        rm -rf "$TMP_DIR"
+
+        if [ "$FLASH_OK" != "1" ]; then
+          abort "E3009: Flashing failed. Your recovery partition may need to be restored manually via fastboot."
+        fi
+
+        ui_print "- Recovery flashed successfully."
+        ui_print "- Reboot to recovery to use it."
+        exit 0
+        EOF
+        chmod 755 flashable_zip/META-INF/com/google/android/update-binary
+
+        echo "#MAGISK" > flashable_zip/META-INF/com/google/android/updater-script
+
+        cd flashable_zip
+        zip -r9 "../${ZIP_NAME}" .
+        cd ..
+
+        echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+        echo "IMG_NAME=${IMG_NAME}" >> $GITHUB_ENV
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Upload to gofile
+      id: gofile
+      run: |
+        SERVER=$(curl -s https://api.gofile.io/servers | grep -o '"name":"[^"]*"' | head -n1 | cut -d'"' -f4)
+        echo "Using gofile server: $SERVER"
+
+        upload_and_get_link() {
+          FILE_PATH=$1
+          RESPONSE=$(curl -s -F "file=@${FILE_PATH}" "https://${SERVER}.gofile.io/uploadFile")
+          echo "$RESPONSE" | grep -o '"downloadPage":"[^"]*"' | cut -d'"' -f4 | sed 's/\\\//\//g'
+        }
+
+        IMG_LINK=$(upload_and_get_link "${{ steps.pwd.outputs.workspace-folder }}/${IMG_NAME}")
+        ZIP_LINK=$(upload_and_get_link "${{ steps.pwd.outputs.workspace-folder }}/${ZIP_NAME}")
+
+        echo "IMG_LINK=${IMG_LINK}" >> $GITHUB_ENV
+        echo "ZIP_LINK=${ZIP_LINK}" >> $GITHUB_ENV
+        echo "### Gofile Links" >> $GITHUB_STEP_SUMMARY
+        echo "- IMG: ${IMG_LINK}" >> $GITHUB_STEP_SUMMARY
+        echo "- Flashable ZIP: ${ZIP_LINK}" >> $GITHUB_STEP_SUMMARY
