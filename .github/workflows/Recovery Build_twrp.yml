@@ -45,14 +45,7 @@ on:
         description: 'Android version this build targets'
         required: true
         default: 'Android 14'
-        type: choice
-        options:
-          - Android 11
-          - Android 12
-          - Android 13
-          - Android 14
-          - Android 15
-          - Android 16
+        
 #      PATCH_INSTALLET:
 #        description: 'Patch recovery installer'
 #        required: true
@@ -145,13 +138,10 @@ jobs:
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
       id: pwd
       
-    - name: Clone common tree
-      if: |
-        github.event.inputs.COMMON_TREE_URL != null
-        && github.event.inputs.COMMON_PATH != null
+    - name: Repo Sync
       run: |
-        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        repo sync -j$(nproc --all) --force-sync
+      working-directory: workspace
 
     - name: Check Build Tree
       uses: haya14busa/action-cond@v1
